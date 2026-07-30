@@ -88,44 +88,29 @@ let isCapturingFrame = false;
 
 function captureNextFrame(onFrameCallback) {
     if (!isLiveViewActive) return;
-    if (isCapturingFrame) return; // Cegah penumpukan proses gphoto2
+    if (isCapturingFrame) return; 
     
     isCapturingFrame = true;
-    console.log("📸 [DEBUG] Meminta frame dari gphoto2...");
     
-    // Ambil 1 frame secara senyap
-    exec('gphoto2 --capture-preview --filename -', { encoding: 'buffer', timeout: 2000 }, (err, stdout, stderr) => {
+    // Waktu tunggu (timeout) dinaikkan menjadi 10 detik. 
+    // Kamera DSLR butuh 3-5 detik untuk mengangkat cermin mekanik (mirror lock-up) saat pertama kali masuk LiveView.
+    exec('gphoto2 --capture-preview --filename -', { encoding: 'buffer', timeout: 10000 }, (err, stdout, stderr) => {
         if (err) {
             console.log("❌ [DEBUG] gphoto2 ERROR:", err.message);
             if (stderr) console.log("   [DEBUG] stderr:", stderr.toString());
+            console.log("⚠️ [DEBUG] Mengulangi permintaan frame dari kamera...");
         } else {
-            console.log(`✅ [DEBUG] gphoto2 BERHASIL! Ukuran: ${stdout ? stdout.length : 0} bytes`);
-        }
-
-        // Jika sukses dan bukan file kosong
-        if (isLiveViewActive && !err && stdout && stdout.length > 100) {
-            onFrameCallback(stdout.toString('base64'));
-        } else if (err) {
-            console.log("⚠️ [DEBUG] Mencoba fallback ke /dev/video0 (Webcam)...");
-            // Jika gphoto2 gagal (kamera sibuk/mati), coba pakai /dev/video0 sebagai cadangan
-            exec('ffmpeg -y -f video4linux2 -i /dev/video0 -vframes 1 -f image2pipe -', { encoding: 'buffer', timeout: 2000 }, (errF, stdoutF, stderrF) => {
-                if (errF) {
-                    console.log("❌ [DEBUG] ffmpeg ERROR:", errF.message);
-                } else {
-                    console.log(`✅ [DEBUG] ffmpeg BERHASIL! Ukuran: ${stdoutF ? stdoutF.length : 0} bytes`);
-                }
-                
-                if (isLiveViewActive && !errF && stdoutF && stdoutF.length > 100) {
-                    onFrameCallback(stdoutF.toString('base64'));
-                }
-            });
+            // Jika sukses dan bukan file kosong
+            if (isLiveViewActive && stdout && stdout.length > 100) {
+                onFrameCallback(stdout.toString('base64'));
+            }
         }
         
         isCapturingFrame = false;
         
-        // Jeda aman 50ms agar tidak membebani CPU Linux, lalu ambil frame berikutnya
+        // Jeda aman lalu ambil frame berikutnya
         if (isLiveViewActive) {
-            setTimeout(() => captureNextFrame(onFrameCallback), 50);
+            setTimeout(() => captureNextFrame(onFrameCallback), 100);
         }
     });
 }
