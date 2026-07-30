@@ -124,19 +124,30 @@ function captureNextFrame(onFrameCallback) {
     
     isCapturingFrame = true;
     
-    // Waktu tunggu (timeout) dinaikkan menjadi 10 detik. 
     // Kamera DSLR butuh 3-5 detik untuk mengangkat cermin mekanik (mirror lock-up) saat pertama kali masuk LiveView.
-    exec('gphoto2 --capture-preview --filename -', { encoding: 'buffer', timeout: 10000 }, (err, stdout, stderr) => {
-        if (err) {
-            // Hindari spam error saat sedang dijepret
-            if (!isCameraBusy) {
-                console.log("❌ [DEBUG] gphoto2 ERROR:", err.message);
-                console.log("⚠️ [DEBUG] Mengulangi permintaan frame dari kamera...");
+    const previewFile = '/tmp/preview.jpg';
+    const thumbFile = '/tmp/thumb_preview.jpg'; // Canon memaksa prefix thumb_
+    
+    exec(`gphoto2 --capture-preview --filename ${previewFile} --force-overwrite`, { timeout: 10000 }, (err) => {
+        let frameData = null;
+        try {
+            if (fs.existsSync(thumbFile)) {
+                frameData = fs.readFileSync(thumbFile);
+            } else if (fs.existsSync(previewFile)) {
+                frameData = fs.readFileSync(previewFile);
+            }
+        } catch (e) {}
+
+        if (frameData && frameData.length > 100) {
+            // Jika sukses baca file fisik
+            if (isLiveViewActive && !isCameraBusy) {
+                onFrameCallback(frameData.toString('base64'));
             }
         } else {
-            // Jika sukses dan bukan file kosong
-            if (isLiveViewActive && !isCameraBusy && stdout && stdout.length > 100) {
-                onFrameCallback(stdout.toString('base64'));
+            // Hindari spam error saat sedang dijepret
+            if (!isCameraBusy) {
+                console.log("❌ [DEBUG] gphoto2 ERROR:", err ? err.message : "File preview gagal dibuat");
+                console.log("⚠️ [DEBUG] Mengulangi permintaan frame dari kamera...");
             }
         }
         
@@ -169,10 +180,19 @@ function stopLiveView() {
  * Digunakan untuk Web Browser Live Preview (http://localhost:3000/preview)
  */
 function getSinglePreviewFrame(res) {
-    exec('gphoto2 --capture-preview --filename -', { encoding: 'buffer', timeout: 2000 }, (err, stdout) => {
-        if (!err && stdout && stdout.length > 100) {
+    const previewFile = '/tmp/preview.jpg';
+    const thumbFile = '/tmp/thumb_preview.jpg';
+
+    exec(`gphoto2 --capture-preview --filename ${previewFile} --force-overwrite`, { timeout: 2000 }, (err) => {
+        let frameData = null;
+        try {
+            if (fs.existsSync(thumbFile)) frameData = fs.readFileSync(thumbFile);
+            else if (fs.existsSync(previewFile)) frameData = fs.readFileSync(previewFile);
+        } catch (e) {}
+
+        if (frameData && frameData.length > 100) {
             res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache, no-store, must-revalidate' });
-            res.end(stdout);
+            res.end(frameData);
         } else {
             // Jika gphoto2 tidak tersambung fisik, otomatis tangkap dari Webcam Linux bawaan (/dev/video0)
             exec('ffmpeg -y -f video4linux2 -i /dev/video0 -vframes 1 -f image2pipe -', { encoding: 'buffer', timeout: 2000 }, (errF, stdoutF) => {
