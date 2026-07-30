@@ -32,25 +32,46 @@ async function getStatus() {
     });
 }
 
+// --- SISTEM MUTEX LOCK ---
+let isCameraBusy = false;
+let isCapturingFrame = false; // Status untuk loop LiveView
+let globalOnFrameCallback = null; // Menyimpan callback LiveView
+
+const waitForCamera = async () => {
+    while (isCameraBusy || isCapturingFrame) {
+        await new Promise(r => setTimeout(r, 100)); // Tunggu 100ms sampai jalur USB kosong
+    }
+};
+
 /**
  * Mengambil foto dari kamera dan menyimpannya di folder target.
  * Saat foto disimpan ke folder utama, watcher.js akan mendeteksi dan mengompresnya secara otomatis.
  */
 async function capturePhoto(targetFolder) {
+    // 1. Tunggu sampai gphoto2 sebelumnya (LiveView) selesai
+    await waitForCamera();
+    
+    // 2. Kunci jalur USB
+    isCameraBusy = true;
+    
+    // 3. Matikan sementara flag LiveView agar loop tidak menyerobot
+    const wasLiveViewActive = isLiveViewActive;
+    isLiveViewActive = false;
+    
     return new Promise((resolve) => {
         fs.ensureDirSync(targetFolder);
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
         const filename = `photo_linux_${timestamp}.jpg`;
         const filePath = path.join(targetFolder, filename);
 
-        console.log(`📸 [LINUX CAMERA] Mengeksekusi pengambilan foto ke: ${filePath}`);
+        console.log(`📸 [LINUX CAMERA] (LOCK AKTIF) Mengeksekusi pengambilan foto utama...`);
 
         // Perintah CLI gphoto2 untuk jepret foto langsung ke disk Linux dengan kecepatan tinggi
         const command = `gphoto2 --capture-image-and-download --filename "${filePath}" --force-overwrite`;
 
         exec(command, (error, stdout, stderr) => {
             if (error) {
-                console.log(`ℹ️ Info dari gphoto2 (atau di mode simulasi/manual): Kamera hardware fisik belum dipasang, mengaktifkan penangkapan alternatif.`);
+                console.log(`❌ [LINUX CAMERA] Error saat menjepret:`, error.message);
                 // Coba tangkap dari webcam (/dev/video0) jika ada, atau tunggu input foto manual yang ditarik watcher
                 exec(`ffmpeg -y -f video4linux2 -i /dev/video0 -vframes 1 "${filePath}"`, (errFfmpeg) => {
                     if (errFfmpeg && !fs.existsSync(filePath)) {
@@ -60,6 +81,18 @@ async function capturePhoto(targetFolder) {
             } else {
                 console.log(`✅ [LINUX CAMERA] Sukses jepret & unduh foto: ${filename}`);
             }
+            
+            // 4. Buka Kunci USB
+            isCameraBusy = false;
+            
+            // 5. Kembalikan mode LiveView jika sebelumnya menyala
+            if (wasLiveViewActive && globalOnFrameCallback) {
+                console.log(`📸 [LINUX CAMERA] Melanjutkan LiveView kembali...`);
+                isLiveViewActive = true;
+                // Beri jeda 1 detik agar mekanik lensa kamera rileks sebelum buka mirror lagi
+                setTimeout(() => captureNextFrame(globalOnFrameCallback), 1000); 
+            }
+            
             resolve(filePath);
         });
     });
@@ -84,11 +117,10 @@ function setShutter(val) {
     exec(`gphoto2 --set-config shutterspeed="${val}"`, () => {});
 }
 
-let isCapturingFrame = false;
-
 function captureNextFrame(onFrameCallback) {
+    // Berhenti jika dimatikan atau jika kamera sedang dijepret (Lock)
     if (!isLiveViewActive) return;
-    if (isCapturingFrame) return; 
+    if (isCapturingFrame || isCameraBusy) return; 
     
     isCapturingFrame = true;
     
@@ -96,12 +128,14 @@ function captureNextFrame(onFrameCallback) {
     // Kamera DSLR butuh 3-5 detik untuk mengangkat cermin mekanik (mirror lock-up) saat pertama kali masuk LiveView.
     exec('gphoto2 --capture-preview --filename -', { encoding: 'buffer', timeout: 10000 }, (err, stdout, stderr) => {
         if (err) {
-            console.log("❌ [DEBUG] gphoto2 ERROR:", err.message);
-            if (stderr) console.log("   [DEBUG] stderr:", stderr.toString());
-            console.log("⚠️ [DEBUG] Mengulangi permintaan frame dari kamera...");
+            // Hindari spam error saat sedang dijepret
+            if (!isCameraBusy) {
+                console.log("❌ [DEBUG] gphoto2 ERROR:", err.message);
+                console.log("⚠️ [DEBUG] Mengulangi permintaan frame dari kamera...");
+            }
         } else {
             // Jika sukses dan bukan file kosong
-            if (isLiveViewActive && stdout && stdout.length > 100) {
+            if (isLiveViewActive && !isCameraBusy && stdout && stdout.length > 100) {
                 onFrameCallback(stdout.toString('base64'));
             }
         }
@@ -109,7 +143,7 @@ function captureNextFrame(onFrameCallback) {
         isCapturingFrame = false;
         
         // Jeda aman lalu ambil frame berikutnya
-        if (isLiveViewActive) {
+        if (isLiveViewActive && !isCameraBusy) {
             setTimeout(() => captureNextFrame(onFrameCallback), 100);
         }
     });
@@ -118,6 +152,7 @@ function captureNextFrame(onFrameCallback) {
 function startLiveView(onFrameCallback) {
     if (isLiveViewActive) return;
     isLiveViewActive = true;
+    globalOnFrameCallback = onFrameCallback;
     console.log(`📹 [LINUX CAMERA] Memulai streaming LiveView...`);
     
     isCapturingFrame = false;
