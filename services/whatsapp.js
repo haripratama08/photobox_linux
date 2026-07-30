@@ -1,10 +1,19 @@
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
+const fs = require('fs-extra');
+
+// Mendeteksi letak Chromium/Chrome natif bawaan Linux (agar tidak pakai bundled puppeteer)
+let chromePath = '/usr/bin/chromium-browser'; // Default Ubuntu/Raspbian
+if (!fs.existsSync(chromePath)) {
+    if (fs.existsSync('/usr/bin/chromium')) chromePath = '/usr/bin/chromium'; // Arch/Manjaro
+    else if (fs.existsSync('/usr/bin/google-chrome')) chromePath = '/usr/bin/google-chrome'; // Ekstra
+}
 
 // Optimalisasi Super Enteng (Low RAM usage) untuk Chromium di Linux Desktop / Kiosk
 const waClient = new Client({
     authStrategy: new LocalAuth(),
     puppeteer: { 
+        executablePath: chromePath,
         headless: true,
         args: [
             '--no-sandbox',

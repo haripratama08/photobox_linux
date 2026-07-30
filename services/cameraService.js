@@ -84,23 +84,71 @@ function setShutter(val) {
     exec(`gphoto2 --set-config shutterspeed="${val}"`, () => {});
 }
 
-let liveViewInterval = null;
+let isCapturingFrame = false;
+
+function captureNextFrame(onFrameCallback) {
+    if (!isLiveViewActive) return;
+    if (isCapturingFrame) return; // Cegah penumpukan proses gphoto2
+    
+    isCapturingFrame = true;
+    // Ambil 1 frame secara senyap
+    exec('gphoto2 --capture-preview --filename -', { encoding: 'buffer', timeout: 2000 }, (err, stdout) => {
+        // Jika sukses dan bukan file kosong
+        if (isLiveViewActive && !err && stdout && stdout.length > 100) {
+            onFrameCallback(stdout.toString('base64'));
+        } else if (err) {
+            // Jika gphoto2 gagal (kamera sibuk/mati), coba pakai /dev/video0 sebagai cadangan
+            exec('ffmpeg -y -f video4linux2 -i /dev/video0 -vframes 1 -f image2pipe -', { encoding: 'buffer', timeout: 2000 }, (errF, stdoutF) => {
+                if (isLiveViewActive && !errF && stdoutF && stdoutF.length > 100) {
+                    onFrameCallback(stdoutF.toString('base64'));
+                }
+            });
+        }
+        
+        isCapturingFrame = false;
+        
+        // Jeda aman 50ms agar tidak membebani CPU Linux, lalu ambil frame berikutnya
+        if (isLiveViewActive) {
+            setTimeout(() => captureNextFrame(onFrameCallback), 50);
+        }
+    });
+}
+
 function startLiveView(onFrameCallback) {
     if (isLiveViewActive) return;
     isLiveViewActive = true;
     console.log(`📹 [LINUX CAMERA] Memulai streaming LiveView...`);
     
-    // Pengecekan atau penangkapan stream ringan untuk ditampilkan di frontend Flutter Linux
-    liveViewInterval = setInterval(() => {
-        if (!isLiveViewActive) return clearInterval(liveViewInterval);
-        // Bisa diintegrasikan dengan buffer frame kamera jika dibutuhkan oleh antarmuka
-    }, 100);
+    isCapturingFrame = false;
+    captureNextFrame(onFrameCallback);
 }
 
 function stopLiveView() {
     isLiveViewActive = false;
-    if (liveViewInterval) clearInterval(liveViewInterval);
     console.log(`⏹️ [LINUX CAMERA] LiveView dihentikan.`);
+}
+
+/**
+ * Menarik SATU frame pratinjau cepat (JPEG) langsung dari buffer stdout (Tanpa simpan ke disk).
+ * Digunakan untuk Web Browser Live Preview (http://localhost:3000/preview)
+ */
+function getSinglePreviewFrame(res) {
+    exec('gphoto2 --capture-preview --filename -', { encoding: 'buffer', timeout: 2000 }, (err, stdout) => {
+        if (!err && stdout && stdout.length > 100) {
+            res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache, no-store, must-revalidate' });
+            res.end(stdout);
+        } else {
+            // Jika gphoto2 tidak tersambung fisik, otomatis tangkap dari Webcam Linux bawaan (/dev/video0)
+            exec('ffmpeg -y -f video4linux2 -i /dev/video0 -vframes 1 -f image2pipe -', { encoding: 'buffer', timeout: 2000 }, (errF, stdoutF) => {
+                if (!errF && stdoutF && stdoutF.length > 100) {
+                    res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache, no-store, must-revalidate' });
+                    res.end(stdoutF);
+                } else {
+                    res.status(500).send('Kamera tidak terdeteksi atau mati.');
+                }
+            });
+        }
+    });
 }
 
 module.exports = {
@@ -110,5 +158,6 @@ module.exports = {
     setIso,
     setShutter,
     startLiveView,
-    stopLiveView
+    stopLiveView,
+    getSinglePreviewFrame
 };
