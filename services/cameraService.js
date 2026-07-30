@@ -91,14 +91,30 @@ function captureNextFrame(onFrameCallback) {
     if (isCapturingFrame) return; // Cegah penumpukan proses gphoto2
     
     isCapturingFrame = true;
+    console.log("📸 [DEBUG] Meminta frame dari gphoto2...");
+    
     // Ambil 1 frame secara senyap
-    exec('gphoto2 --capture-preview --filename -', { encoding: 'buffer', timeout: 2000 }, (err, stdout) => {
+    exec('gphoto2 --capture-preview --filename -', { encoding: 'buffer', timeout: 2000 }, (err, stdout, stderr) => {
+        if (err) {
+            console.log("❌ [DEBUG] gphoto2 ERROR:", err.message);
+            if (stderr) console.log("   [DEBUG] stderr:", stderr.toString());
+        } else {
+            console.log(`✅ [DEBUG] gphoto2 BERHASIL! Ukuran: ${stdout ? stdout.length : 0} bytes`);
+        }
+
         // Jika sukses dan bukan file kosong
         if (isLiveViewActive && !err && stdout && stdout.length > 100) {
             onFrameCallback(stdout.toString('base64'));
         } else if (err) {
+            console.log("⚠️ [DEBUG] Mencoba fallback ke /dev/video0 (Webcam)...");
             // Jika gphoto2 gagal (kamera sibuk/mati), coba pakai /dev/video0 sebagai cadangan
-            exec('ffmpeg -y -f video4linux2 -i /dev/video0 -vframes 1 -f image2pipe -', { encoding: 'buffer', timeout: 2000 }, (errF, stdoutF) => {
+            exec('ffmpeg -y -f video4linux2 -i /dev/video0 -vframes 1 -f image2pipe -', { encoding: 'buffer', timeout: 2000 }, (errF, stdoutF, stderrF) => {
+                if (errF) {
+                    console.log("❌ [DEBUG] ffmpeg ERROR:", errF.message);
+                } else {
+                    console.log(`✅ [DEBUG] ffmpeg BERHASIL! Ukuran: ${stdoutF ? stdoutF.length : 0} bytes`);
+                }
+                
                 if (isLiveViewActive && !errF && stdoutF && stdoutF.length > 100) {
                     onFrameCallback(stdoutF.toString('base64'));
                 }
