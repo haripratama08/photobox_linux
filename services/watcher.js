@@ -34,7 +34,7 @@ const initWatcher = (io) => {
                 console.log(`📸 [LINUX INOTIFY] Foto dikompres & diamankan: /${activeUserFolder}/${filename}`);
 
                 io.emit('photo-ready', {
-                    url: `http://localhost:${config.PORT}/photos/${encodeURIComponent(activeUserFolder)}/${filename}`,
+                    url: `${config.PUBLIC_BASE_URL}/photos/${encodeURIComponent(activeUserFolder)}/${filename}`,
                     filename: filename
                 });
             } catch (err) {

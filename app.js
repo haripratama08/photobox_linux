@@ -10,7 +10,8 @@ const io = require('socket.io')(http, {
 });
 const socketHandler = require('./sockets/socketHandler');
 const watcherService = require('./services/watcher');
-const cameraService = require('./services/cameraService'); // Integrasi LiveView Browser
+const cameraService = require('./services/cameraService');
+const dashboardClient = require('./services/dashboardClient');
 
 fs.ensureDirSync(config.BASE_PHOTO_FOLDER);
 fs.ensureDirSync(config.FRAMES_FOLDER);
@@ -44,8 +45,9 @@ app.get('/preview-frame', (req, res) => {
 socketHandler(io);
 watcherService.initWatcher(io);
 
-http.listen(config.PORT, () => {
+http.listen(config.PORT, config.HOST, () => {
     console.log(`================================================`);
-    console.log(`🚀 NODE.JS PHOTOBOX AKTIF DI PORT: ${config.PORT}`);
+    console.log(`🚀 ${config.BOX_ID} AKTIF DI ${config.HOST}:${config.PORT}`);
     console.log(`================================================`);
+    dashboardClient.startHeartbeat();
 });

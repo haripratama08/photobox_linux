@@ -1,33 +1,60 @@
-const { exec } = require('child_process');
+const { execFile } = require('child_process');
 const fs = require('fs-extra');
 const path = require('path');
+const config = require('../config/config');
 
 let isLiveViewActive = false;
-let cameraConnected = true;
+let cameraConnected = false;
 let currentIso = "Auto";
 let currentShutter = "Auto";
+let targetLiveViewFps = Math.max(1, Math.min(30, config.LIVEVIEW_FALLBACK_FPS));
+
+const cameraArgs = (args) => {
+    if (!config.CAMERA_PORT) return args;
+    return ['--port', config.CAMERA_PORT, ...args];
+};
+
+const runGphoto = (args, options, callback) => {
+    execFile('gphoto2', cameraArgs(args), options, callback);
+};
 
 /**
  * Layanan Kamera Linux Natif (Tanpa DigiCamControl)
  * Menggunakan command CLI gphoto2 / v4l2 agar super enteng, cepat, dan hemat resource RAM/CPU di Linux.
  */
 async function getStatus() {
+    if (isCameraBusy || isCapturingFrame) {
+        return {
+            connected: cameraConnected,
+            model: cameraConnected
+                ? `🟢 Kamera ${config.BOX_ID} sedang digunakan`
+                : `🔴 Kamera ${config.BOX_ID} tidak terdeteksi`
+        };
+    }
+
     return new Promise((resolve) => {
-        // Pengecekan status kamera secara real via gphoto2 di Linux
-        exec('gphoto2 --summary', (error, stdout, stderr) => {
+        runGphoto(['--summary'], { timeout: 5000 }, (error, stdout) => {
             if (!error && stdout && !stdout.toLowerCase().includes('error')) {
                 cameraConnected = true;
-                return resolve({ connected: true, model: "🟢 Kamera Linux (gphoto2) Terhubung" });
+                return resolve({
+                    connected: true,
+                    model: `🟢 Kamera ${config.BOX_ID} terhubung`
+                });
             }
             
-            // Alternatif pengecekan webcam/kamera UVC (v4l2) di filesystem Linux
-            if (fs.existsSync('/dev/video0')) {
+            if (fs.existsSync(config.VIDEO_DEVICE)) {
                 cameraConnected = true;
-                return resolve({ connected: true, model: "🟢 Kamera Video Linux (/dev/video0) Terhubung" });
+                return resolve({
+                    connected: true,
+                    model: `🟢 Kamera video ${config.VIDEO_DEVICE} terhubung`
+                });
             }
 
-            // Mode Manual / Fallback untuk pengujian atau jika kamera terpasang secara manual di direktori
-            resolve({ connected: true, model: "🟢 Kamera Linux Siap (Mode Natif/Manual)" });
+            cameraConnected = false;
+            resolve({
+                connected: false,
+                model: `🔴 Kamera ${config.BOX_ID} tidak terdeteksi`
+            });
         });
     });
 }
@@ -66,14 +93,24 @@ async function capturePhoto(targetFolder) {
 
         console.log(`📸 [LINUX CAMERA] (LOCK AKTIF) Mengeksekusi pengambilan foto utama...`);
 
-        // Perintah CLI gphoto2 untuk jepret foto langsung ke disk Linux dengan kecepatan tinggi
-        const command = `gphoto2 --capture-image-and-download --filename "${filePath}" --force-overwrite`;
-
-        exec(command, (error, stdout, stderr) => {
+        runGphoto([
+            '--capture-image-and-download',
+            '--filename',
+            filePath,
+            '--force-overwrite'
+        ], { timeout: 30000 }, (error) => {
             if (error) {
                 console.log(`❌ [LINUX CAMERA] Error saat menjepret:`, error.message);
-                // Coba tangkap dari webcam (/dev/video0) jika ada, atau tunggu input foto manual yang ditarik watcher
-                exec(`ffmpeg -y -f video4linux2 -i /dev/video0 -vframes 1 "${filePath}"`, (errFfmpeg) => {
+                execFile('ffmpeg', [
+                    '-y',
+                    '-f',
+                    'video4linux2',
+                    '-i',
+                    config.VIDEO_DEVICE,
+                    '-vframes',
+                    '1',
+                    filePath
+                ], { timeout: 15000 }, (errFfmpeg) => {
                     if (errFfmpeg && !fs.existsSync(filePath)) {
                         console.log(`⏳ Sistem siap menerima file foto di folder pemantauan (${targetFolder}) untuk diproses otomatis.`);
                     }
@@ -100,21 +137,21 @@ async function capturePhoto(targetFolder) {
 
 function autoFocus() {
     console.log(`🎯 [LINUX CAMERA] Memicu Auto-Focus kamera...`);
-    exec('gphoto2 --set-config autofocusdrive=1', (err) => {
-        if (err) exec('gphoto2 --set-config autofocus=1', () => {});
+    runGphoto(['--set-config', 'autofocusdrive=1'], {}, (err) => {
+        if (err) runGphoto(['--set-config', 'autofocus=1'], {}, () => {});
     });
 }
 
 function setIso(val) {
     currentIso = val;
     console.log(`⚙️ [LINUX CAMERA] Set ISO ke: ${val}`);
-    exec(`gphoto2 --set-config iso="${val}"`, () => {});
+    runGphoto(['--set-config', `iso=${val}`], {}, () => {});
 }
 
 function setShutter(val) {
     currentShutter = val;
     console.log(`⚙️ [LINUX CAMERA] Set Shutter Speed ke: ${val}`);
-    exec(`gphoto2 --set-config shutterspeed="${val}"`, () => {});
+    runGphoto(['--set-config', `shutterspeed=${val}`], {}, () => {});
 }
 
 function captureNextFrame(onFrameCallback) {
@@ -123,12 +160,21 @@ function captureNextFrame(onFrameCallback) {
     if (isCapturingFrame || isCameraBusy) return; 
     
     isCapturingFrame = true;
+    const cycleStartedAt = Date.now();
     
     // Kamera DSLR butuh 3-5 detik untuk mengangkat cermin mekanik (mirror lock-up) saat pertama kali masuk LiveView.
-    const previewFile = '/tmp/preview.jpg';
-    const thumbFile = '/tmp/thumb_preview.jpg'; // Canon memaksa prefix thumb_
+    const previewFile = config.PREVIEW_FILE;
+    const thumbFile = path.join(
+        path.dirname(previewFile),
+        `thumb_${path.basename(previewFile)}`
+    );
     
-    exec(`gphoto2 --capture-preview --filename ${previewFile} --force-overwrite`, { timeout: 10000 }, (err) => {
+    runGphoto([
+        '--capture-preview',
+        '--filename',
+        previewFile,
+        '--force-overwrite'
+    ], { timeout: 10000 }, (err) => {
         let frameData = null;
         try {
             if (fs.existsSync(thumbFile)) {
@@ -153,11 +199,34 @@ function captureNextFrame(onFrameCallback) {
         
         isCapturingFrame = false;
         
-        // Jeda aman lalu ambil frame berikutnya
+        // Target FPS adalah batas atas. Durasi proses gphoto2 ikut dihitung agar
+        // tiga kamera tidak menghasilkan antrean frame atau beban CPU berlebih.
         if (isLiveViewActive && !isCameraBusy) {
-            setTimeout(() => captureNextFrame(onFrameCallback), 100);
+            const frameIntervalMs = Math.round(1000 / targetLiveViewFps);
+            const elapsedMs = Date.now() - cycleStartedAt;
+            const nextFrameDelayMs = Math.max(0, frameIntervalMs - elapsedMs);
+            setTimeout(() => captureNextFrame(onFrameCallback), nextFrameDelayMs);
         }
     });
+}
+
+function setTargetFps(fps, activeCount = 0) {
+    const parsedFps = Number(fps);
+    const nextFps = Number.isFinite(parsedFps)
+        ? Math.max(1, Math.min(30, Math.round(parsedFps)))
+        : config.LIVEVIEW_FALLBACK_FPS;
+
+    if (nextFps === targetLiveViewFps) return;
+    targetLiveViewFps = nextFps;
+    const source = activeCount > 0 ? `${activeCount} liveview aktif` : 'mode aman';
+    console.log(`⚖️ [LIVEVIEW BALANCER] Target ${targetLiveViewFps} FPS (${source}).`);
+}
+
+function getLiveViewState() {
+    return {
+        active: isLiveViewActive,
+        targetFps: targetLiveViewFps
+    };
 }
 
 function startLiveView(onFrameCallback) {
@@ -180,10 +249,18 @@ function stopLiveView() {
  * Digunakan untuk Web Browser Live Preview (http://localhost:3000/preview)
  */
 function getSinglePreviewFrame(res) {
-    const previewFile = '/tmp/preview.jpg';
-    const thumbFile = '/tmp/thumb_preview.jpg';
+    const previewFile = config.PREVIEW_FILE;
+    const thumbFile = path.join(
+        path.dirname(previewFile),
+        `thumb_${path.basename(previewFile)}`
+    );
 
-    exec(`gphoto2 --capture-preview --filename ${previewFile} --force-overwrite`, { timeout: 2000 }, (err) => {
+    runGphoto([
+        '--capture-preview',
+        '--filename',
+        previewFile,
+        '--force-overwrite'
+    ], { timeout: 3000 }, (err) => {
         let frameData = null;
         try {
             if (fs.existsSync(thumbFile)) frameData = fs.readFileSync(thumbFile);
@@ -194,8 +271,18 @@ function getSinglePreviewFrame(res) {
             res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache, no-store, must-revalidate' });
             res.end(frameData);
         } else {
-            // Jika gphoto2 tidak tersambung fisik, otomatis tangkap dari Webcam Linux bawaan (/dev/video0)
-            exec('ffmpeg -y -f video4linux2 -i /dev/video0 -vframes 1 -f image2pipe -', { encoding: 'buffer', timeout: 2000 }, (errF, stdoutF) => {
+            execFile('ffmpeg', [
+                '-y',
+                '-f',
+                'video4linux2',
+                '-i',
+                config.VIDEO_DEVICE,
+                '-vframes',
+                '1',
+                '-f',
+                'image2pipe',
+                '-'
+            ], { encoding: 'buffer', timeout: 3000, maxBuffer: 20 * 1024 * 1024 }, (errF, stdoutF) => {
                 if (!errF && stdoutF && stdoutF.length > 100) {
                     res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Cache-Control': 'no-cache, no-store, must-revalidate' });
                     res.end(stdoutF);
@@ -215,5 +302,7 @@ module.exports = {
     setShutter,
     startLiveView,
     stopLiveView,
+    setTargetFps,
+    getLiveViewState,
     getSinglePreviewFrame
 };

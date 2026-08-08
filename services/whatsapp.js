@@ -1,86 +1,232 @@
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
 const fs = require('fs-extra');
+const os = require('os');
+const path = require('path');
+const sharp = require('sharp');
+const config = require('../config/config');
+const { withResourceLock } = require('./resourceLock');
 
-// Mendeteksi letak Chromium/Chrome natif bawaan Linux (agar tidak pakai bundled puppeteer)
-let chromePath = '/usr/bin/chromium-browser'; // Default Ubuntu/Raspbian
-if (!fs.existsSync(chromePath)) {
-    if (fs.existsSync('/usr/bin/chromium')) chromePath = '/usr/bin/chromium'; // Arch/Manjaro
-    else if (fs.existsSync('/usr/bin/google-chrome')) chromePath = '/usr/bin/google-chrome'; // Ekstra
-}
+const MAX_UPLOAD_BYTES = 3.8 * 1024 * 1024;
+const STATUS_CACHE_MS = 60 * 1000;
+let cachedStatus = null;
+let cachedStatusAt = 0;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Optimalisasi Super Enteng (Low RAM usage) untuk Chromium di Linux Desktop / Kiosk
-const waClient = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: { 
-        executablePath: chromePath,
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--no-first-run',
-            '--no-default-browser-check',
-            '--disable-extensions',
-            '--disable-background-networking',
-            '--disable-default-apps',
-            '--disable-sync',
-            '--disable-translate',
-            '--mute-audio',
-            '--no-zygote',
-            '--disable-accelerated-2d-canvas'
-        ]
+const normalizeTarget = (value) => {
+    let target = String(value || '').replace(/\D/g, '');
+    const countryCode = String(config.FONNTE_COUNTRY_CODE || '62').replace(/\D/g, '');
+    if (target.startsWith('0')) target = `${countryCode}${target.slice(1)}`;
+    if (target && !target.startsWith(countryCode)) target = `${countryCode}${target}`;
+    return target;
+};
+
+const responseSucceeded = (payload) =>
+    payload?.status === true || payload?.Status === true;
+
+const fonnteRequest = async (pathname, options = {}) => {
+    if (!config.FONNTE_TOKEN) {
+        throw new Error('FONNTE_TOKEN belum dikonfigurasi');
     }
-});
 
-waClient.on('qr', (qr) => {
-    console.log('\n📱 SCAN QR CODE INI MENGGUNAKAN WHATSAPP ANDA:');
-    qrcode.generate(qr, { small: true });
-});
-waClient.on('ready', () => console.log('✅ BOT WHATSAPP SUDAH AKTIF DAN SIAP MENGIRIM! (Mode Low-Memory Linux)'));
-waClient.initialize();
+    const { timeoutMs = 30000, ...fetchOptions } = options;
+    const response = await fetch(`${config.FONNTE_API_URL}${pathname}`, {
+        method: 'POST',
+        ...fetchOptions,
+        headers: {
+            Authorization: config.FONNTE_TOKEN,
+            ...(fetchOptions.headers || {})
+        },
+        signal: AbortSignal.timeout(timeoutMs)
+    });
 
-const delay = ms => new Promise(res => setTimeout(res, ms));
-
-const sendWhatsappMsg = async (userWA, userName, attachments) => {
-    if (!userWA || attachments.length === 0) return;
-
-    let cleanWA = userWA.replace(/\D/g, '');
-    if (cleanWA.startsWith('0')) cleanWA = '62' + cleanWA.substring(1);
-    else if (!cleanWA.startsWith('62')) cleanWA = '62' + cleanWA;
-
-    const chatId = cleanWA + "@c.us";
-    console.log(`⏳ Mengirim WA ke: ${cleanWA}...`);
-    
+    const rawBody = await response.text();
+    let payload;
     try {
-        const isRegistered = await waClient.isRegisteredUser(chatId);
-        if (isRegistered) {
-            await waClient.sendMessage(chatId, `Halo *${userName}*! 👋\nIni hasil jepretan kamu dari Photobox hari ini (Frame + Mentahan). Terima kasih ya sudah mampir! 📸✨`);
-            await delay(2000); // Jeda 2 detik setelah teks pembuka
-            
-            // Loop File dengan Try-Catch dan Delay Anti-Spam
-            for (let file of attachments) {
-                try {
-                    console.log(`⏳ Sedang mengirim file: ${file.path}`);
-                    const media = MessageMedia.fromFilePath(file.path);
-                    await waClient.sendMessage(chatId, media, { sendMediaAsDocument: true });
-                    console.log(`✅ File ${file.filename} terkirim (sebagai Dokumen)!`);
-                    
-                    // Jeda acak antara 2 hingga 4 detik sebelum mengirim file berikutnya
-                    const randomDelay = Math.floor(Math.random() * (4000 - 2000 + 1)) + 2000;
-                    await delay(randomDelay);
-                } catch (mediaError) {
-                    console.log(`❌ Gagal mengirim file ${file.filename}. Error:`, mediaError.message);
-                }
-            }
-            console.log(`✅ [WA] Sukses terkirim seluruhnya!`);
-        } else {
-            console.log(`⚠️ [WA] Gagal: Nomor tidak terdaftar di WA!`);
+        payload = JSON.parse(rawBody);
+    } catch (_) {
+        throw new Error(`Respons Fonnte tidak valid (HTTP ${response.status})`);
+    }
+
+    if (!response.ok || !responseSucceeded(payload)) {
+        throw new Error(
+            payload.reason || payload.detail || `Fonnte HTTP ${response.status}`
+        );
+    }
+    return payload;
+};
+
+const sendText = (target, message) => fonnteRequest('/send', {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+        target,
+        message,
+        countryCode: '0',
+        connectOnly: config.FONNTE_CONNECT_ONLY
+    })
+});
+
+const mimeForFile = (filename) => {
+    const extension = path.extname(filename).toLowerCase();
+    if (extension === '.png') return 'image/png';
+    if (extension === '.jpg' || extension === '.jpeg') return 'image/jpeg';
+    if (extension === '.pdf') return 'application/pdf';
+    return 'application/octet-stream';
+};
+
+const prepareAttachment = async (attachment) => {
+    const sourcePath = attachment.path;
+    const stats = await fs.stat(sourcePath);
+    if (stats.size <= MAX_UPLOAD_BYTES) {
+        return { path: sourcePath, filename: attachment.filename, temporary: false };
+    }
+
+    if (!/\.(png|jpe?g)$/i.test(sourcePath)) {
+        throw new Error(`${attachment.filename} melebihi batas unggahan Fonnte`);
+    }
+
+    const outputPath = path.join(
+        os.tmpdir(),
+        `fonnte-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.jpg`
+    );
+    await sharp(sourcePath)
+        .rotate()
+        .resize({ width: 1800, withoutEnlargement: true })
+        .jpeg({ quality: 80, mozjpeg: true })
+        .toFile(outputPath);
+
+    const outputStats = await fs.stat(outputPath);
+    if (outputStats.size > MAX_UPLOAD_BYTES) {
+        await fs.remove(outputPath);
+        await sharp(sourcePath)
+            .rotate()
+            .resize({ width: 1400, withoutEnlargement: true })
+            .jpeg({ quality: 68, mozjpeg: true })
+            .toFile(outputPath);
+    }
+
+    return {
+        path: outputPath,
+        filename: `${path.parse(attachment.filename).name}.jpg`,
+        temporary: true
+    };
+};
+
+const sendFile = async (target, attachment, message = '') => {
+    const prepared = await prepareAttachment(attachment);
+    try {
+        const buffer = await fs.readFile(prepared.path);
+        if (buffer.length > MAX_UPLOAD_BYTES) {
+            throw new Error(`${prepared.filename} masih melebihi batas unggahan Fonnte`);
         }
-    } catch (err) {
-        console.log(`❌ [WA] Gagal terkirim:`, err.message);
+
+        const mimeType = mimeForFile(prepared.filename);
+        const fileBlob = typeof File !== 'undefined'
+            ? new File([buffer], prepared.filename, { type: mimeType })
+            : new Blob([buffer], { type: mimeType });
+
+        const form = new FormData();
+        form.append('target', target);
+        // Fonnte API mewajibkan parameter 'message' tidak boleh string kosong ('')
+        form.append('message', message && message.trim() ? message : ' ');
+        form.append('countryCode', '0');
+        form.append('connectOnly', String(config.FONNTE_CONNECT_ONLY));
+        form.append('filename', prepared.filename);
+        // Hanya sertakan 'file' untuk unggahan berkas multipart (JANGAN sertakan 'url' agar Fonnte tidak menganggapnya link web)
+        form.append('file', fileBlob, prepared.filename);
+
+        return await fonnteRequest('/send', { body: form });
+    } finally {
+        if (prepared.temporary) {
+            await fs.remove(prepared.path).catch(() => {});
+        }
     }
 };
 
-module.exports = { sendWhatsappMsg };
+const getWhatsappStatus = async () => {
+    if (!config.ENABLE_WHATSAPP) {
+        return { ok: false, message: 'Pengiriman WhatsApp dinonaktifkan' };
+    }
+    if (!config.FONNTE_TOKEN) {
+        return { ok: false, message: 'Token Fonnte belum diisi' };
+    }
+
+    if (cachedStatus && Date.now() - cachedStatusAt < STATUS_CACHE_MS) {
+        return cachedStatus;
+    }
+
+    try {
+        const profile = await fonnteRequest('/device', { timeoutMs: 5000 });
+        cachedStatus = {
+            ok: profile.device_status === 'connect',
+            message: profile.device_status === 'connect'
+                ? `Fonnte terhubung (kuota ${profile.quota ?? '-'})`
+                : 'Perangkat Fonnte tidak terhubung'
+        };
+    } catch (error) {
+        cachedStatus = { ok: false, message: `Fonnte: ${error.message}` };
+    }
+    cachedStatusAt = Date.now();
+    return cachedStatus;
+};
+
+const sendWhatsappJob = async (userWA, userName, attachments) => {
+    if (!userWA || attachments.length === 0) return { skipped: true };
+    if (!config.ENABLE_WHATSAPP || !config.FONNTE_TOKEN) {
+        console.log(`⚠️ Fonnte belum aktif untuk ${config.BOX_ID}.`);
+        return { skipped: true };
+    }
+
+    const target = normalizeTarget(userWA);
+    if (!target) throw new Error('Nomor WhatsApp tidak valid');
+
+    const greetingCaption = `Halo kak *${userName}*! ✨\nFoto photobox kamu udah siap nih 🥳\n\nMakasih yaa udah nyimpan kenangan bareng kita. Ditunggu kedatangannya lagi! 📸❤️`;
+
+    const results = [];
+    let isFirstFile = true;
+    let photoCounter = 1;
+
+    for (const attachment of attachments) {
+        try {
+            const caption = isFirstFile 
+                ? greetingCaption 
+                : `📷 Foto ${photoCounter++}`;
+            const result = await sendFile(target, attachment, caption);
+            results.push({ filename: attachment.filename, queued: true, result });
+            console.log(`✅ [FONNTE] ${attachment.filename} berhasil dikirim.`);
+            isFirstFile = false;
+        } catch (error) {
+            results.push({ filename: attachment.filename, queued: false, error: error.message });
+            console.log(`❌ [FONNTE] ${attachment.filename} gagal: ${error.message}`);
+        }
+        await sleep(config.FONNTE_REQUEST_DELAY_MS);
+    }
+
+    const anyFileSent = results.some(r => r.queued);
+    if (!anyFileSent) {
+        console.log(`⚠️ Foto gagal dikirim via Fonnte, mengirimkan pesan teks sapaan...`);
+        await sendText(target, greetingCaption);
+    }
+
+    return { skipped: false, target, results };
+};
+
+const sendWhatsappMsg = (userWA, userName, attachments) => {
+    if (!userWA || attachments.length === 0) return Promise.resolve({ skipped: true });
+    if (!config.ENABLE_WHATSAPP || !config.FONNTE_TOKEN) {
+        return sendWhatsappJob(userWA, userName, attachments);
+    }
+
+    return withResourceLock(
+        `fonnte:${config.FONNTE_TOKEN}`,
+        () => sendWhatsappJob(userWA, userName, attachments),
+        {
+            label: 'pengiriman Fonnte',
+            timeoutMs: 300000,
+            staleMs: 600000
+        }
+    );
+};
+
+module.exports = {
+    sendWhatsappMsg,
+    getWhatsappStatus
+};
